@@ -1,0 +1,13 @@
+# railway.toml
+# This file tells Railway how to build and run your app
+
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "npm start"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
+
+[[services]]
+name = "dealhunter-backend"

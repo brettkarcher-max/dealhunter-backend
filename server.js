@@ -23,7 +23,7 @@ async function scrapeCarBids() {
 
   cache.scraping = true;
   cache.error = null;
-  console.log(`[${new Date().toISOString()}] Starting scrape v4...`);
+  console.log(`[${new Date().toISOString()}] Starting scrape v5...`);
 
   let browser;
   try {
@@ -63,44 +63,67 @@ async function scrapeCarBids() {
     console.log('Page title:', await page.title());
     console.log('Page URL:', page.url());
 
-    // Wait for React to render
-    await page.waitForTimeout(5000);
+    // Wait for initial render
+    await page.waitForTimeout(3000);
 
-    // Extract all auction links and their text content
+    // Incrementally scroll to trigger lazy loading of all listings
+    console.log('Scrolling to load all listings...');
+    for (let i = 1; i <= 15; i++) {
+      await page.evaluate((step) => window.scrollTo(0, step * 600), i);
+      await page.waitForTimeout(400);
+    }
+    await page.waitForTimeout(2000);
+
+    // Scroll back to top then bottom again
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await page.waitForTimeout(1000);
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await page.waitForTimeout(3000);
+
+    console.log('Extracting listings...');
+
     const rawListings = await page.evaluate(() => {
       const results = [];
       const links = document.querySelectorAll('a[href*="/auctions/"]');
+      console.log('Total auction links found:', links.length);
 
       links.forEach(link => {
         try {
           const href = link.getAttribute('href') || '';
-          // Skip non-auction pages like /auctions/search, /auctions/past etc
-          if (!href.match(/\/auctions\/[a-zA-Z0-9]+\//)) return;
+
+          // Only process actual auction listing pages
+          if (!href.match(/\/auctions\/[a-zA-Z0-9]{6,}/)) return;
+          if (href.includes('/auctions/search') || href.includes('/auctions/past') || href.includes('/auctions/results')) return;
 
           const allText = link.innerText || '';
           if (!allText || allText.length < 10) return;
 
-          // Title is usually the first line
+          // Title must start with a year
           const lines = allText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
           const title = lines[0] || '';
-
-          // Skip nav/footer links
           if (!title.match(/^\d{4}/)) return;
 
-          // Bid amount
-          const bidMatch = allText.match(/\$[\d,]+/g);
-          const bid = bidMatch ? parseInt(bidMatch[bidMatch.length - 1].replace(/[^0-9]/g, '')) : 0;
+          // Bid amount - take the last $ amount found (most likely to be current bid)
+          const bidMatches = allText.match(/\$[\d,]+/g);
+          const bid = bidMatches ? parseInt(bidMatches[bidMatches.length - 1].replace(/[^0-9]/g, '')) : 0;
+          if (bid === 0) return;
 
           // No reserve
           const noReserve = allText.toLowerCase().includes('no reserve');
 
-          // Time - look for "X Days", "X Hours", "Xh Xm Xs" patterns
+          // Time remaining - handle all formats
           const daysMatch = allText.match(/(\d+)\s*days?/i);
           const hoursMatch = allText.match(/(\d+)\s*hours?/i);
-          const hrsMatch = allText.match(/(\d+)h\s*\d+m/i);
+          const hmsMatch = allText.match(/(\d+)h\s*(\d+)m/i);
+          const minsMatch = allText.match(/(\d+)\s*mins?/i);
+          const colonMatch = allText.match(/(\d+):(\d+):(\d+)/); // HH:MM:SS format
           const timeText = daysMatch ? daysMatch[0] :
             hoursMatch ? hoursMatch[0] :
-            hrsMatch ? hrsMatch[0] : '';
+            hmsMatch ? hmsMatch[0] :
+            minsMatch ? minsMatch[0] :
+            colonMatch ? colonMatch[0] : '';
+
+          if (!timeText) console.log('NO TIME:', title, '|', allText.substring(0, 100));
 
           // Bid count
           const bidsMatch = allText.match(/(\d+)\s*bid/i);
@@ -112,9 +135,7 @@ async function scrapeCarBids() {
 
           const url = `https://carsandbids.com${href}`;
 
-          if (title && bid > 0) {
-            results.push({ title, bid, timeText, bidCount, noReserve, url, image });
-          }
+          results.push({ title, bid, timeText, bidCount, noReserve, url, image });
         } catch (e) {}
       });
 
@@ -139,10 +160,14 @@ async function scrapeCarBids() {
       const timeStr = raw.timeText || '';
       const daysMatch = timeStr.match(/(\d+)\s*days?/i);
       const hoursMatch = timeStr.match(/(\d+)\s*hours?/i);
-      const hrsMatch = timeStr.match(/(\d+)h/i);
+      const hmsMatch = timeStr.match(/(\d+)h\s*(\d+)m/i);
+      const minsMatch = timeStr.match(/(\d+)\s*min/i);
+      const colonMatch = timeStr.match(/(\d+):(\d+):(\d+)/);
       const hoursLeft = daysMatch ? parseInt(daysMatch[1]) * 24 :
         hoursMatch ? parseInt(hoursMatch[1]) :
-        hrsMatch ? parseInt(hrsMatch[1]) : 48;
+        hmsMatch ? parseInt(hmsMatch[1]) + parseInt(hmsMatch[2]) / 60 :
+        colonMatch ? parseInt(colonMatch[1]) + parseInt(colonMatch[2]) / 60 :
+        minsMatch ? parseInt(minsMatch[1]) / 60 : 48;
 
       const marketValue = estimateMarketValue(parsed.year, parsed.make, parsed.model, raw.bid);
       const discountPct = marketValue > 0
@@ -248,10 +273,8 @@ function calcDealScore(discountPct, hoursLeft, bidCount, noReserve) {
   return Math.min(score, 99);
 }
 
-// ─── Routes ───────────────────────────────────────────────────────────────────
-
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: 4, lastScraped: cache.lastScraped, scraping: cache.scraping, count: cache.listings.length });
+  res.json({ status: 'ok', version: 5, lastScraped: cache.lastScraped, scraping: cache.scraping, count: cache.listings.length });
 });
 
 app.get('/api/listings', async (req, res) => {
@@ -294,7 +317,7 @@ app.get('/api/status', (req, res) => res.json({ isScanning: cache.scraping, cach
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`DealHunter backend v4 running on port ${PORT}`);
+  console.log(`DealHunter backend v5 running on port ${PORT}`);
   scrapeCarBids();
   setInterval(scrapeCarBids, SCRAPE_INTERVAL_MS);
 });

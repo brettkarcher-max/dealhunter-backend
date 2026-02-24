@@ -71,8 +71,11 @@ async function scrapeCarBids() {
       console.log('Auction selector not found, trying fallback...');
     });
 
-    // Give JS a moment to hydrate
+  // Give JS a moment to hydrate
     await page.waitForTimeout(2000);
+
+    const pageHTML = await page.content();
+    console.log('PAGE SNAPSHOT:', pageHTML.substring(0, 3000));
 
     // Scrape all visible auction cards
     const rawListings = await page.evaluate(() => {

@@ -102,7 +102,7 @@ page.on('response', async (response) => {
     if (rawAuctions.length > 0) console.log('Auction fields:', JSON.stringify(Object.keys(rawAuctions[0])));
 
   const listings = rawAuctions.map((auction, idx) => {
-    const title = `${auction.year} ${auction.make} ${auction.model}` || '';
+    const title = auction.title || `${auction.year} ${auction.make} ${auction.model}` || '';
     const year = auction.year || 0;
     const make = auction.make || '';
     const model = auction.model || '';
@@ -112,9 +112,8 @@ page.on('response', async (response) => {
     const bidCount = auction.bid_count || auction.bidCount || auction.bids || 0;
     const slug = auction.slug || auction.id || '';
     const url = slug ? `https://carsandbids.com/auctions/${slug}` : '';
-    const image = auction.thumbnail || auction.image ||
-      (auction.images && auction.images[0]) || '';
-    const endsAt = auction.ends_at || auction.endsAt || auction.end_time || null;
+    const image = auction.main_photo || auction.thumbnail || auction.image || '';
+    const endsAt = auction.auction_end || auction.ends_at || auction.endsAt || null;
     let hoursLeft = 48;
     if (endsAt) {
       const msLeft = new Date(endsAt).getTime() - Date.now();

@@ -61,7 +61,7 @@ async function scrapeCarBids() {
     );
 
     console.log('Navigating to Cars & Bids...');
-    await page.goto('https://carsandbids.com', {
+    await page.goto('https://carsandbids.com/auctions/', {
       waitUntil: 'domcontentloaded',
       timeout: 30000,
     });
@@ -76,6 +76,8 @@ async function scrapeCarBids() {
 
     const pageHTML = await page.content();
     console.log('PAGE SNAPSHOT:', pageHTML.substring(0, 3000));
+	console.log('PAGE TITLE:', await page.title());
+	console.log('PAGE URL:', page.url());
 
     // Scrape all visible auction cards
     const rawListings = await page.evaluate(() => {

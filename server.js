@@ -54,6 +54,21 @@ async function scrapeCarBids() {
     // Block fonts only
     await page.route('**/*.{woff,woff2,ttf,eot}', route => route.abort());
 
+    let auctionData = null;
+page.on('response', async (response) => {
+  const url = response.url();
+  if (url.includes('/autos/auctions') || url.includes('/v2/autos')) {
+    try {
+      console.log('Intercepted API:', url);
+      const json = await response.json();
+      if (json && (json.auctions || json.results || Array.isArray(json))) {
+        auctionData = json;
+        console.log('Got API data, keys:', Object.keys(json));
+      }
+    } catch (e) {}
+  }
+});
+
     console.log('Loading Cars and Bids auctions page...');
     await page.goto('https://carsandbids.com/auctions/', {
       waitUntil: 'networkidle',
@@ -80,6 +95,47 @@ async function scrapeCarBids() {
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
     await page.waitForTimeout(3000);
 
+    if (auctionData) {
+  console.log('Using intercepted API data!');
+  const rawAuctions = auctionData.auctions || auctionData.results || auctionData.data || [];
+  console.log('API auction count:', rawAuctions.length);
+
+  const listings = rawAuctions.map((auction, idx) => {
+    const title = `${auction.year} ${auction.make} ${auction.model}` || '';
+    const year = auction.year || 0;
+    const make = auction.make || '';
+    const model = auction.model || '';
+    const trim = auction.trim || '';
+    const currentBid = auction.current_bid || auction.currentBid || auction.bid || 0;
+    const noReserve = auction.no_reserve || auction.noReserve || false;
+    const bidCount = auction.bid_count || auction.bidCount || auction.bids || 0;
+    const slug = auction.slug || auction.id || '';
+    const url = slug ? `https://carsandbids.com/auctions/${slug}` : '';
+    const image = auction.thumbnail || auction.image ||
+      (auction.images && auction.images[0]) || '';
+    const endsAt = auction.ends_at || auction.endsAt || auction.end_time || null;
+    let hoursLeft = 48;
+    if (endsAt) {
+      const msLeft = new Date(endsAt).getTime() - Date.now();
+      hoursLeft = Math.max(0, msLeft / 1000 / 60 / 60);
+    }
+    const marketValue = estimateMarketValue(year, make, model, currentBid);
+    const discountPct = marketValue > 0 ? Math.round(((marketValue - currentBid) / marketValue) * 100) : 0;
+    const dealScore = calcDealScore(discountPct, hoursLeft, bidCount, noReserve);
+    return {
+      id: `cnb-${idx}-${Date.now()}`,
+      year, make, model, trim, title, currentBid, marketValue,
+      discountPct, dealScore, hoursLeft, bids: bidCount, noReserve,
+      location: auction.location || 'United States',
+      url, image, scrapedAt: new Date().toISOString(),
+    };
+  });
+
+  cache.listings = listings;
+  cache.lastScraped = new Date().toISOString();
+  console.log(`API scrape complete. ${listings.length} listings cached.`);
+  return;
+}
     console.log('Extracting listings...');
 
     const rawListings = await page.evaluate(() => {

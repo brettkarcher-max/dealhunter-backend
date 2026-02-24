@@ -103,16 +103,21 @@ page.on('response', async (response) => {
 
   const listings = rawAuctions.map((auction, idx) => {
     const title = auction.title || `${auction.year} ${auction.make} ${auction.model}` || '';
-    const year = auction.year || 0;
-    const make = auction.make || '';
-    const model = auction.model || '';
-    const trim = auction.trim || '';
     const currentBid = auction.current_bid || auction.currentBid || auction.bid || 0;
     const noReserve = auction.no_reserve || auction.noReserve || false;
     const bidCount = auction.bid_count || auction.bidCount || auction.bids || 0;
-    const slug = auction.slug || auction.id || '';
+    const parsed = parseTitle(auction.title || '');
+    const year = auction.year || parsed.year || 0;
+    const make = auction.make || parsed.make || '';
+    const model = auction.model || parsed.model || '';
+    const trim = auction.trim || parsed.trim || '';
+    const mileage = auction.mileage || '';
+    const subTitle = auction.sub_title || '';
+    const slug = auction.id || '';
     const url = slug ? `https://carsandbids.com/auctions/${slug}` : '';
-    const image = auction.main_photo || auction.thumbnail || auction.image || '';
+    const image = auction.main_photo
+      ? `https://${auction.main_photo.base_url}/${auction.main_photo.path}`
+      : '';
     const endsAt = auction.auction_end || auction.ends_at || auction.endsAt || null;
     let hoursLeft = 48;
     if (endsAt) {
@@ -124,7 +129,7 @@ page.on('response', async (response) => {
     const dealScore = calcDealScore(discountPct, hoursLeft, bidCount, noReserve);
     return {
       id: `cnb-${idx}-${Date.now()}`,
-      year, make, model, trim, title, currentBid, marketValue,
+      year, make, model, trim, title, subTitle, mileage, currentBid, marketValue,
       discountPct, dealScore, hoursLeft, bids: bidCount, noReserve,
       location: auction.location || 'United States',
       url, image, scrapedAt: new Date().toISOString(),

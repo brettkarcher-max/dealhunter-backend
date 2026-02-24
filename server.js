@@ -11,7 +11,6 @@ let cache = {
   lastScraped: null,
   scraping: false,
   error: null,
-  debugHTML: null,
 };
 
 const SCRAPE_INTERVAL_MS = 20 * 60 * 1000;
@@ -52,128 +51,97 @@ async function scrapeCarBids() {
 
     const page = await context.newPage();
 
-    await page.route('**/*.{woff,woff2,ttf,eot}', route => route.abort());
+    // Intercept the auctions API call and capture its response
+    let auctionData = null;
 
-    console.log('Navigating to Cars & Bids auctions page...');
-    const response = await page.goto('https://carsandbids.com/auctions/', {
+    page.on('response', async (response) => {
+      const url = response.url();
+      if (url.includes('/v2/autos/auctions') || url.includes('/autos/auctions')) {
+        try {
+          console.log('Intercepted API call:', url);
+          const json = await response.json();
+          console.log('API response keys:', Object.keys(json));
+          auctionData = json;
+        } catch (e) {
+          console.log('Failed to parse intercepted response:', e.message);
+        }
+      }
+    });
+
+    console.log('Navigating to Cars & Bids...');
+    await page.goto('https://carsandbids.com/auctions/', {
       waitUntil: 'networkidle',
       timeout: 45000,
     });
 
-    console.log('HTTP status:', response?.status());
-    console.log('Final URL:', page.url());
     console.log('Page title:', await page.title());
 
-    await page.waitForTimeout(4000);
+    // Give extra time for all API calls to complete
+    await page.waitForTimeout(5000);
 
-    const html = await page.content();
-    cache.debugHTML = html.substring(0, 5000);
-    console.log('=== HTML SNAPSHOT ===');
-    console.log(html.substring(0, 3000));
-    console.log('=== END SNAPSHOT ===');
-
-    const classNames = await page.evaluate(() => {
-      const all = Array.from(document.querySelectorAll('*'));
-      const classes = new Set();
-      all.forEach(el => {
-        if (el.className && typeof el.className === 'string') {
-          el.className.split(' ').forEach(c => {
-            if (c && (c.includes('auction') || c.includes('listing') || c.includes('card') || c.includes('item'))) {
-              classes.add(c);
-            }
-          });
-        }
+    if (!auctionData) {
+      console.log('No auction API data intercepted. Trying direct page navigation...');
+      // Try navigating to a different sort to trigger another API call
+      await page.goto('https://carsandbids.com/auctions/?sort=ending-soon', {
+        waitUntil: 'networkidle',
+        timeout: 30000,
       });
-      return Array.from(classes);
-    });
-    console.log('Relevant class names found:', JSON.stringify(classNames));
+      await page.waitForTimeout(3000);
+    }
 
-    const strategies = [
-      'li[class*="auction"]',
-      'div[class*="auction"]',
-      'article[class*="auction"]',
-      '[class*="auction-card"]',
-      '[class*="auction-item"]',
-      '[class*="listing-card"]',
-      '[class*="AuctionCard"]',
-      '[class*="AuctionItem"]',
-      'ul[class*="auctions"] li',
-      '[data-testid*="auction"]',
-      'a[href*="/auctions/"]',
-    ];
+    if (!auctionData) {
+      throw new Error('Could not intercept Cars & Bids API response. The site may have changed its API structure.');
+    }
 
-    let usedSelector = '';
-    let maxFound = 0;
+    console.log('Raw API data sample:', JSON.stringify(auctionData).substring(0, 500));
 
-    for (const selector of strategies) {
-      const found = await page.$$(selector);
-      console.log(`Selector "${selector}": ${found.length} elements`);
-      if (found.length > maxFound) {
-        maxFound = found.length;
-        usedSelector = selector;
+    // Parse the API response — Cars & Bids typically returns { auctions: [...] } or { results: [...] }
+    const rawAuctions = auctionData.auctions || auctionData.results || auctionData.data || auctionData || [];
+    console.log(`Found ${Array.isArray(rawAuctions) ? rawAuctions.length : 'unknown'} auctions in API response`);
+
+    if (!Array.isArray(rawAuctions) || rawAuctions.length === 0) {
+      console.log('Full API response:', JSON.stringify(auctionData).substring(0, 2000));
+      throw new Error('API returned no auctions. Response structure may have changed.');
+    }
+
+    const listings = rawAuctions.map((auction, idx) => {
+      // Extract fields from the API response
+      // These field names are based on common C&B API patterns
+      const title = auction.title || auction.name || `${auction.year} ${auction.make} ${auction.model}` || '';
+      const year = auction.year || parseInt((title.match(/^\d{4}/) || [])[0]) || 0;
+      const make = auction.make || '';
+      const model = auction.model || '';
+      const trim = auction.trim || auction.series || '';
+      const currentBid = auction.current_bid || auction.currentBid || auction.bid || auction.price || 0;
+      const noReserve = auction.no_reserve || auction.noReserve || auction.reserve === false || false;
+      const bidCount = auction.bid_count || auction.bidCount || auction.bids || 0;
+      const location = auction.location || auction.seller_location || auction.city || 'United States';
+      const slug = auction.slug || auction.id || '';
+      const url = slug ? `https://carsandbids.com/auctions/${slug}` : 'https://carsandbids.com/auctions/';
+      const image = auction.thumbnail || auction.image || auction.photo ||
+        (auction.images && auction.images[0]) ||
+        (auction.photos && auction.photos[0]) || '';
+
+      // Parse time remaining
+      const endsAt = auction.ends_at || auction.endsAt || auction.end_time || auction.closing_at || null;
+      let hoursLeft = 48;
+      if (endsAt) {
+        const msLeft = new Date(endsAt).getTime() - Date.now();
+        hoursLeft = Math.max(0, msLeft / 1000 / 60 / 60);
       }
-    }
 
-    console.log(`Best selector: "${usedSelector}" with ${maxFound} elements`);
+      const mileage = auction.mileage || auction.miles || 0;
+      const marketValue = estimateMarketValue(year, make, model, currentBid);
+      const discountPct = marketValue > 0 ? Math.round(((marketValue - currentBid) / marketValue) * 100) : 0;
+      const dealScore = calcDealScore(discountPct, hoursLeft, bidCount, noReserve);
 
-    if (maxFound === 0) {
-      console.log('No cards found. Dumping body text:');
-      const bodyText = await page.evaluate(() => document.body.innerText.substring(0, 2000));
-      console.log(bodyText);
-      cache.listings = [];
-      cache.lastScraped = new Date().toISOString();
-      return;
-    }
-
-    const rawListings = await page.evaluate((sel) => {
-      const results = [];
-      const cards = document.querySelectorAll(sel);
-
-      cards.forEach(card => {
-        try {
-          const allText = card.innerText || '';
-          const titleEl = card.querySelector('h2, h3, [class*="title"], [class*="name"]');
-          const title = titleEl?.innerText?.trim() || '';
-          const bidMatch = allText.match(/\$[\d,]+/g);
-          const bidText = bidMatch ? bidMatch[0] : '';
-          const bid = parseInt(bidText.replace(/[^0-9]/g, '')) || 0;
-          const noReserve = allText.toLowerCase().includes('no reserve');
-          const linkEl = card.tagName === 'A' ? card : card.querySelector('a[href*="/auctions/"]');
-          const href = linkEl?.getAttribute('href') || '';
-          const url = href.startsWith('http') ? href : `https://carsandbids.com${href}`;
-          const imgEl = card.querySelector('img');
-          const image = imgEl?.src || imgEl?.dataset?.src || '';
-          const timeMatch = allText.match(/(\d+[dhm]\s*)+/);
-          const timeText = timeMatch ? timeMatch[0].trim() : '';
-          const bidsMatch = allText.match(/(\d+)\s*bid/i);
-          const bidCount = bidsMatch ? parseInt(bidsMatch[1]) : 0;
-          const locationEl = card.querySelector('[class*="location"], [class*="city"]');
-          const location = locationEl?.innerText?.trim() || '';
-
-          if (title || bid > 0) {
-            results.push({ title, bid, timeText, bidCount, noReserve, location, url, image, snippet: allText.substring(0, 200) });
-          }
-        } catch (e) {}
-      });
-      return results;
-    }, usedSelector);
-
-    console.log(`Extracted ${rawListings.length} raw listings`);
-    if (rawListings.length > 0) console.log('Sample:', JSON.stringify(rawListings[0]));
-
-    const listings = rawListings.map((raw, idx) => {
-      const parsed = parseTitle(raw.title);
-      const hoursLeft = parseTimeLeft(raw.timeText);
-      const marketValue = estimateMarketValue(parsed.year, parsed.make, parsed.model, raw.bid);
-      const discountPct = marketValue > 0 ? Math.round(((marketValue - raw.bid) / marketValue) * 100) : 0;
-      const dealScore = calcDealScore(discountPct, hoursLeft, raw.bidCount, raw.noReserve);
       return {
         id: `cnb-${idx}-${Date.now()}`,
-        year: parsed.year, make: parsed.make, model: parsed.model, trim: parsed.trim,
-        title: raw.title, currentBid: raw.bid, marketValue, discountPct, dealScore,
-        hoursLeft, bids: raw.bidCount, noReserve: raw.noReserve,
-        location: raw.location || 'United States', url: raw.url, image: raw.image,
-        timeText: raw.timeText, scrapedAt: new Date().toISOString(),
+        year, make, model, trim, title,
+        currentBid, marketValue, discountPct, dealScore,
+        hoursLeft, bids: bidCount, noReserve,
+        location, url, image, mileage,
+        scrapedAt: new Date().toISOString(),
       };
     });
 
@@ -188,30 +156,6 @@ async function scrapeCarBids() {
     if (browser) await browser.close();
     cache.scraping = false;
   }
-}
-
-function parseTitle(title) {
-  const match = title.match(/^(\d{4})\s+([A-Za-z\-]+)\s+(.+?)(?:\s*\((.+)\))?$/);
-  if (match) {
-    const [, year, make, rest, trim] = match;
-    const parts = rest.trim().split(/\s+/);
-    return { year: parseInt(year), make: make.trim(), model: parts[0].trim(), trim: trim || parts.slice(1).join(' ') || '' };
-  }
-  return { year: 0, make: '', model: title, trim: '' };
-}
-
-function parseTimeLeft(text) {
-  if (!text) return 48;
-  text = text.toLowerCase();
-  const days = (text.match(/(\d+)\s*d/) || [])[1];
-  const hours = (text.match(/(\d+)\s*h/) || [])[1];
-  const mins = (text.match(/(\d+)\s*m/) || [])[1];
-  let total = 0;
-  if (days) total += parseInt(days) * 24;
-  if (hours) total += parseInt(hours);
-  if (mins) total += parseInt(mins) / 60;
-  if (total === 0 && (text.includes('ending') || text.includes('soon'))) return 0.5;
-  return total || 48;
 }
 
 function estimateMarketValue(year, make, model, currentBid) {
@@ -260,7 +204,6 @@ function calcDealScore(discountPct, hoursLeft, bidCount, noReserve) {
 }
 
 app.get('/health', (req, res) => res.json({ status: 'ok', lastScraped: cache.lastScraped, scraping: cache.scraping }));
-app.get('/debug', (req, res) => res.json({ html: cache.debugHTML, error: cache.error }));
 
 app.get('/api/listings', async (req, res) => {
   const { closeHours = 24, minDiscount = 0, maxBudget, noReserveOnly = 'false' } = req.query;

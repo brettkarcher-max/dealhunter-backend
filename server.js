@@ -99,6 +99,7 @@ page.on('response', async (response) => {
   console.log('Using intercepted API data!');
   const rawAuctions = auctionData.auctions || auctionData.results || auctionData.data || [];
   console.log('API auction count:', rawAuctions.length);
+    if (rawAuctions.length > 0) console.log('Auction fields:', JSON.stringify(Object.keys(rawAuctions[0])));
 
   const listings = rawAuctions.map((auction, idx) => {
     const title = `${auction.year} ${auction.make} ${auction.model}` || '';

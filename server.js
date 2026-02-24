@@ -1,0 +1,300 @@
+const express = require('express');
+const cors = require('cors');
+const { chromium } = require('playwright');
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+let cache = {
+  listings: [],
+  lastScraped: null,
+  scraping: false,
+  error: null,
+};
+
+const SCRAPE_INTERVAL_MS = 20 * 60 * 1000;
+
+async function scrapeCarBids() {
+  if (cache.scraping) {
+    console.log('Scrape already in progress, skipping.');
+    return;
+  }
+
+  cache.scraping = true;
+  cache.error = null;
+  console.log(`[${new Date().toISOString()}] Starting scrape v4...`);
+
+  let browser;
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-gpu',
+        '--single-process',
+      ],
+    });
+
+    const context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      viewport: { width: 1280, height: 900 },
+      locale: 'en-US',
+    });
+
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    });
+
+    const page = await context.newPage();
+
+    // Block fonts only
+    await page.route('**/*.{woff,woff2,ttf,eot}', route => route.abort());
+
+    console.log('Loading Cars and Bids auctions page...');
+    await page.goto('https://carsandbids.com/auctions/', {
+      waitUntil: 'networkidle',
+      timeout: 45000,
+    });
+
+    console.log('Page title:', await page.title());
+    console.log('Page URL:', page.url());
+
+    // Wait for React to render
+    await page.waitForTimeout(5000);
+
+    // Extract all auction links and their text content
+    const rawListings = await page.evaluate(() => {
+      const results = [];
+      const links = document.querySelectorAll('a[href*="/auctions/"]');
+
+      links.forEach(link => {
+        try {
+          const href = link.getAttribute('href') || '';
+          // Skip non-auction pages like /auctions/search, /auctions/past etc
+          if (!href.match(/\/auctions\/[a-zA-Z0-9]+\//)) return;
+
+          const allText = link.innerText || '';
+          if (!allText || allText.length < 10) return;
+
+          // Title is usually the first line
+          const lines = allText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+          const title = lines[0] || '';
+
+          // Skip nav/footer links
+          if (!title.match(/^\d{4}/)) return;
+
+          // Bid amount
+          const bidMatch = allText.match(/\$[\d,]+/g);
+          const bid = bidMatch ? parseInt(bidMatch[bidMatch.length - 1].replace(/[^0-9]/g, '')) : 0;
+
+          // No reserve
+          const noReserve = allText.toLowerCase().includes('no reserve');
+
+          // Time - look for "X Days", "X Hours", "Xh Xm Xs" patterns
+          const daysMatch = allText.match(/(\d+)\s*days?/i);
+          const hoursMatch = allText.match(/(\d+)\s*hours?/i);
+          const hrsMatch = allText.match(/(\d+)h\s*\d+m/i);
+          const timeText = daysMatch ? daysMatch[0] :
+            hoursMatch ? hoursMatch[0] :
+            hrsMatch ? hrsMatch[0] : '';
+
+          // Bid count
+          const bidsMatch = allText.match(/(\d+)\s*bid/i);
+          const bidCount = bidsMatch ? parseInt(bidsMatch[1]) : 0;
+
+          // Image
+          const imgEl = link.querySelector('img');
+          const image = imgEl?.src || imgEl?.dataset?.src || '';
+
+          const url = `https://carsandbids.com${href}`;
+
+          if (title && bid > 0) {
+            results.push({ title, bid, timeText, bidCount, noReserve, url, image });
+          }
+        } catch (e) {}
+      });
+
+      // Deduplicate by URL
+      const seen = new Set();
+      return results.filter(r => {
+        if (seen.has(r.url)) return false;
+        seen.add(r.url);
+        return true;
+      });
+    });
+
+    console.log(`Found ${rawListings.length} raw listings`);
+    if (rawListings.length > 0) {
+      console.log('Sample:', JSON.stringify(rawListings[0]));
+    }
+
+    const listings = rawListings.map((raw, idx) => {
+      const parsed = parseTitle(raw.title);
+
+      // Parse hours left from timeText
+      const timeStr = raw.timeText || '';
+      const daysMatch = timeStr.match(/(\d+)\s*days?/i);
+      const hoursMatch = timeStr.match(/(\d+)\s*hours?/i);
+      const hrsMatch = timeStr.match(/(\d+)h/i);
+      const hoursLeft = daysMatch ? parseInt(daysMatch[1]) * 24 :
+        hoursMatch ? parseInt(hoursMatch[1]) :
+        hrsMatch ? parseInt(hrsMatch[1]) : 48;
+
+      const marketValue = estimateMarketValue(parsed.year, parsed.make, parsed.model, raw.bid);
+      const discountPct = marketValue > 0
+        ? Math.round(((marketValue - raw.bid) / marketValue) * 100)
+        : 0;
+      const dealScore = calcDealScore(discountPct, hoursLeft, raw.bidCount, raw.noReserve);
+
+      return {
+        id: `cnb-${idx}-${Date.now()}`,
+        year: parsed.year,
+        make: parsed.make,
+        model: parsed.model,
+        trim: parsed.trim,
+        title: raw.title,
+        currentBid: raw.bid,
+        marketValue,
+        discountPct,
+        dealScore,
+        hoursLeft,
+        bids: raw.bidCount,
+        noReserve: raw.noReserve,
+        location: 'United States',
+        url: raw.url,
+        image: raw.image,
+        timeText: raw.timeText,
+        scrapedAt: new Date().toISOString(),
+      };
+    });
+
+    cache.listings = listings;
+    cache.lastScraped = new Date().toISOString();
+    console.log(`Scrape complete. ${listings.length} listings cached.`);
+    if (listings.length > 0) {
+      console.log('First listing hoursLeft:', listings[0].hoursLeft, 'timeText:', listings[0].timeText);
+    }
+
+  } catch (err) {
+    console.error('Scrape failed:', err.message);
+    cache.error = err.message;
+  } finally {
+    if (browser) await browser.close();
+    cache.scraping = false;
+  }
+}
+
+function parseTitle(title) {
+  const match = title.match(/^(\d{4})\s+([A-Za-z\-]+)\s+(.+?)(?:\s*\((.+)\))?$/);
+  if (match) {
+    const [, year, make, rest, trim] = match;
+    const parts = rest.trim().split(/\s+/);
+    return {
+      year: parseInt(year),
+      make: make.trim(),
+      model: parts[0].trim(),
+      trim: trim || parts.slice(1).join(' ') || '',
+    };
+  }
+  return { year: 0, make: '', model: title, trim: '' };
+}
+
+function estimateMarketValue(year, make, model, currentBid) {
+  const makeModel = `${make} ${model}`.toLowerCase();
+  let base = currentBid * 1.3;
+  const premiums = [
+    [/porsche.*911/, 2.2], [/porsche.*boxster|cayman/, 1.4],
+    [/bmw.*m3/, 1.8], [/bmw.*m5/, 1.7], [/bmw.*m2|m4/, 1.6],
+    [/mercedes.*amg|c63|e63|s63/, 1.7], [/honda.*s2000/, 1.9],
+    [/honda.*nsx|acura.*nsx/, 2.5], [/toyota.*supra/, 2.4],
+    [/toyota.*land cruiser/, 1.6], [/mazda.*rx-7/, 1.8],
+    [/mazda.*miata|mx-5/, 1.3], [/nissan.*skyline|gtr|gt-r/, 2.2],
+    [/nissan.*370z|350z/, 1.3], [/mitsubishi.*evo|evolution/, 1.7],
+    [/subaru.*sti|wrx/, 1.5], [/ford.*mustang.*gt500|shelby/, 1.8],
+    [/ford.*gt/, 3.0], [/chevrolet.*corvette.*z06/, 1.6],
+    [/chevrolet.*corvette/, 1.4], [/dodge.*viper/, 1.8],
+    [/ferrari/, 2.0], [/lamborghini/, 2.0], [/aston martin/, 1.8],
+    [/mclaren/, 2.0], [/lotus/, 1.5], [/land rover.*defender/, 1.8],
+    [/land rover.*range rover/, 1.4], [/lexus.*lfa/, 3.0],
+    [/lexus.*is-f|is f/, 1.4], [/audi.*rs/, 1.6],
+    [/volkswagen.*gti|golf r/, 1.3], [/volkswagen.*r32/, 1.5],
+  ];
+  for (const [pattern, multiplier] of premiums) {
+    if (pattern.test(makeModel)) { base = currentBid * multiplier; break; }
+  }
+  if (year >= 1970 && year <= 1985) base *= 1.15;
+  if (year >= 1986 && year <= 1995) base *= 1.05;
+  return Math.round(base / 100) * 100;
+}
+
+function calcDealScore(discountPct, hoursLeft, bidCount, noReserve) {
+  let score = 0;
+  if (discountPct >= 40) score += 50;
+  else if (discountPct >= 30) score += 42;
+  else if (discountPct >= 20) score += 32;
+  else if (discountPct >= 15) score += 22;
+  else if (discountPct >= 10) score += 12;
+  if (hoursLeft <= 1) score += 20;
+  else if (hoursLeft <= 3) score += 15;
+  else if (hoursLeft <= 6) score += 10;
+  else if (hoursLeft <= 12) score += 5;
+  if (noReserve) score += 20;
+  if (bidCount < 5) score += 10;
+  else if (bidCount < 15) score += 5;
+  return Math.min(score, 99);
+}
+
+// ─── Routes ───────────────────────────────────────────────────────────────────
+
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', version: 4, lastScraped: cache.lastScraped, scraping: cache.scraping, count: cache.listings.length });
+});
+
+app.get('/api/listings', async (req, res) => {
+  const { closeHours = 24, minDiscount = 0, maxBudget, noReserveOnly = 'false' } = req.query;
+
+  const cacheAge = cache.lastScraped
+    ? (Date.now() - new Date(cache.lastScraped).getTime()) / 1000 / 60
+    : Infinity;
+
+  if (cache.listings.length === 0 || cacheAge > 20) {
+    if (!cache.scraping) scrapeCarBids();
+    if (cache.listings.length === 0) {
+      let waited = 0;
+      while (cache.scraping && waited < 90000) {
+        await new Promise(r => setTimeout(r, 500));
+        waited += 500;
+      }
+    }
+  }
+
+  if (cache.error && cache.listings.length === 0) {
+    return res.status(500).json({ error: cache.error });
+  }
+
+  let filtered = cache.listings.filter(l => {
+    if (parseFloat(closeHours) && l.hoursLeft > parseFloat(closeHours)) return false;
+    if (parseFloat(minDiscount) && l.discountPct < parseFloat(minDiscount)) return false;
+    if (maxBudget && l.currentBid > parseFloat(maxBudget)) return false;
+    if (noReserveOnly === 'true' && !l.noReserve) return false;
+    return true;
+  });
+
+  filtered.sort((a, b) => b.dealScore - a.dealScore);
+  res.json({ listings: filtered, total: filtered.length, lastScraped: cache.lastScraped, scraping: cache.scraping });
+});
+
+app.post('/api/scrape', (req, res) => { if (!cache.scraping) scrapeCarBids(); res.json({ isScanning: true }); });
+app.post('/api/scan', (req, res) => { if (!cache.scraping) scrapeCarBids(); res.json({ isScanning: true }); });
+app.get('/api/status', (req, res) => res.json({ isScanning: cache.scraping, cachedCount: cache.listings.length, lastScraped: cache.lastScraped, error: cache.error }));
+
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => {
+  console.log(`DealHunter backend v4 running on port ${PORT}`);
+  scrapeCarBids();
+  setInterval(scrapeCarBids, SCRAPE_INTERVAL_MS);
+});

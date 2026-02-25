@@ -462,6 +462,11 @@ app.get('/api/listings', async (req, res) => {
   res.json({ listings: filtered, total: filtered.length, lastScraped: cache.lastScraped, scraping: cache.scraping });
 });
 
+app.get('/api/test-email', async (req, res) => {
+  await sendDailyEmail();
+  res.json({ message: 'Test email sent!' });
+});
+
 app.post('/api/scrape', (req, res) => { if (!cache.scraping) scrapeCarBids(); res.json({ isScanning: true }); });
 app.post('/api/scan', (req, res) => { if (!cache.scraping) scrapeCarBids(); res.json({ isScanning: true }); });
 app.get('/api/status', (req, res) => res.json({ isScanning: cache.scraping, cachedCount: cache.listings.length, lastScraped: cache.lastScraped, error: cache.error }));

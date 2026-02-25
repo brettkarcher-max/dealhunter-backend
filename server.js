@@ -15,6 +15,96 @@ let cache = {
 
 const SCRAPE_INTERVAL_MS = 20 * 60 * 1000;
 
+const { Resend } = require('resend');
+const resend = new Resend(process.env.RESEND_API_KEY);
+
+async function sendDailyEmail() {
+  const topDeals = cache.listings
+    .filter(l => l.hoursLeft <= 24 && l.dealScore >= 60)
+    .sort((a, b) => b.dealScore - a.dealScore)
+    .slice(0, 10);
+
+  if (topDeals.length === 0) {
+    console.log('No deals to email today.');
+    return;
+  }
+
+  const dealsHtml = topDeals.map(car => `
+    <tr>
+      <td style="padding:12px;border-bottom:1px solid #eee">
+        <a href="${car.url}" style="font-weight:bold;color:#e85d26;text-decoration:none">${car.title}</a><br>
+        <span style="color:#666;font-size:13px">${car.subTitle || car.mileage || ''}</span>
+      </td>
+      <td style="padding:12px;border-bottom:1px solid #eee;text-align:right">
+        <strong>$${car.currentBid.toLocaleString()}</strong><br>
+        <span style="color:#666;font-size:13px">Est. $${car.marketValue.toLocaleString()}</span>
+      </td>
+      <td style="padding:12px;border-bottom:1px solid #eee;text-align:center">
+        <span style="background:${car.dealScore >= 90 ? '#ff4444' : car.dealScore >= 75 ? '#ff8c00' : '#4CAF50'};color:white;padding:4px 10px;border-radius:12px;font-size:13px">
+          ${car.dealScore >= 90 ? '🔥' : '⭐'} ${car.dealScore}
+        </span>
+      </td>
+      <td style="padding:12px;border-bottom:1px solid #eee;text-align:center;color:#666;font-size:13px">
+        ${car.discountPct}% below est.<br>
+        ${car.hoursLeft < 1 ? 'Ending soon!' : car.hoursLeft < 24 ? Math.round(car.hoursLeft) + 'h left' : Math.round(car.hoursLeft / 24) + 'd left'}
+        ${car.noReserve ? '<br><span style="color:#e85d26;font-weight:bold">NO RESERVE</span>' : ''}
+      </td>
+    </tr>
+  `).join('');
+
+  const html = `
+    <div style="font-family:Arial,sans-serif;max-width:700px;margin:0 auto">
+      <div style="background:#1a1a2e;padding:24px;border-radius:8px 8px 0 0">
+        <h1 style="color:white;margin:0;font-size:24px">🔥 DealHunter Daily Digest</h1>
+        <p style="color:#aaa;margin:8px 0 0">${new Date().toLocaleDateString('en-US', { weekday:'long', month:'long', day:'numeric' })} · ${cache.listings.length} auctions scanned</p>
+      </div>
+      <div style="background:white;padding:24px;border-radius:0 0 8px 8px;border:1px solid #eee">
+        <h2 style="color:#333;margin-top:0">Top ${topDeals.length} Deals Closing Today</h2>
+        <table style="width:100%;border-collapse:collapse">
+          <thead>
+            <tr style="background:#f5f5f5">
+              <th style="padding:10px 12px;text-align:left;color:#666;font-size:13px">VEHICLE</th>
+              <th style="padding:10px 12px;text-align:right;color:#666;font-size:13px">BID / EST VALUE</th>
+              <th style="padding:10px 12px;text-align:center;color:#666;font-size:13px">SCORE</th>
+              <th style="padding:10px 12px;text-align:center;color:#666;font-size:13px">DETAILS</th>
+            </tr>
+          </thead>
+          <tbody>${dealsHtml}</tbody>
+        </table>
+        <p style="color:#999;font-size:12px;margin-top:24px">
+          Market values are estimates. Always do your own research before bidding.<br>
+          <a href="https://carsandbids.com" style="color:#e85d26">View all auctions on Cars & Bids →</a>
+        </p>
+      </div>
+    </div>
+  `;
+
+  try {
+    await resend.emails.send({
+      from: 'DealHunter <onboarding@resend.dev>',
+      to: process.env.ALERT_EMAIL,
+      subject: `🔥 ${topDeals.length} Car Deals Closing Today - DealHunter`,
+      html,
+    });
+    console.log('Daily email sent successfully!');
+  } catch (err) {
+    console.error('Failed to send email:', err.message);
+  }
+}
+
+function scheduleDailyEmail() {
+  const now = new Date();
+  const next10am = new Date();
+  next10am.setHours(10, 0, 0, 0);
+  if (next10am <= now) next10am.setDate(next10am.getDate() + 1);
+  const msUntil = next10am.getTime() - now.getTime();
+  console.log(`Daily email scheduled in ${Math.round(msUntil / 1000 / 60)} minutes`);
+  setTimeout(() => {
+    sendDailyEmail();
+    setInterval(sendDailyEmail, 24 * 60 * 60 * 1000);
+  }, msUntil);
+}
+
 async function scrapeCarBids() {
   if (cache.scraping) {
     console.log('Scrape already in progress, skipping.');
@@ -381,4 +471,5 @@ app.listen(PORT, () => {
   console.log(`DealHunter backend v5 running on port ${PORT}`);
   scrapeCarBids();
   setInterval(scrapeCarBids, SCRAPE_INTERVAL_MS);
+  scheduleDailyEmail();
 });

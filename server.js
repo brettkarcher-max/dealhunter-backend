@@ -196,6 +196,7 @@ page.on('response', async (response) => {
     const currentBid = auction.current_bid || auction.currentBid || auction.bid || 0;
     const noReserve = auction.no_reserve || auction.noReserve || false;
     const bidCount = auction.bid_count || auction.bidCount || auction.bids || 0;
+    const watching = auction.watching || 0;
     const parsed = parseTitle(auction.title || '');
     const year = auction.year || parsed.year || 0;
     const make = auction.make || parsed.make || '';
@@ -222,7 +223,7 @@ page.on('response', async (response) => {
       year, make, model, trim, title, subTitle, mileage, currentBid, marketValue,
       discountPct, dealScore, hoursLeft, bids: bidCount, noReserve,
       location: auction.location || 'United States',
-      url, image, scrapedAt: new Date().toISOString(),
+      url, image, mileage, watching, scrapedAt: new Date().toISOString(),
     };
   });
 
@@ -466,7 +467,6 @@ app.get('/api/test-email', async (req, res) => {
   await sendDailyEmail();
   res.json({ message: 'Test email sent!' });
 });
-
 app.post('/api/scrape', (req, res) => { if (!cache.scraping) scrapeCarBids(); res.json({ isScanning: true }); });
 app.post('/api/scan', (req, res) => { if (!cache.scraping) scrapeCarBids(); res.json({ isScanning: true }); });
 app.get('/api/status', (req, res) => res.json({ isScanning: cache.scraping, cachedCount: cache.listings.length, lastScraped: cache.lastScraped, error: cache.error }));
